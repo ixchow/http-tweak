@@ -116,16 +116,70 @@ struct server {
 
 //------ internals ------
 
-
 struct message {
 	bool ready = false;
 	std::string data;
 	std::shared_ptr< message > next;
 };
 
+struct incoming_request : request {
+	//state == line curently being recv'd
+	enum {
+		RequestLine,
+		HeaderLine,
+		Body,
+	} mode = RequestLine;
+
+	uint32_t content_remains = 0;
+	std::string line = "";
+	void reset() {
+		*this = incoming_request();
+	}
+	bool parse_bytes(char const *begin, ssize_t count, std::function< void() > const &on_finish) {
+		for (char const *c = begin; c < begin + count; ++c) {
+			if (mode == RequestLine || mode == HeaderLine) {
+				line += *c;
+				//at end-of-line, do something:
+				if (line.size() > 2 && line[line.size() - 2] == '\r' && line[line.size()-1] == '\n') {
+					line.erase(line.size()-2); //trim CRLF
+					if (mode == RequestLine) {
+						if (line.size() == 0) {
+							//ignore empty line before request
+						} else {
+							//TODO: parse "method SP url SP version"
+						}
+					} else { assert(mode == HeaderLine);
+						if (line.size() == 0) {
+							//empty line between headers and body!
+							mode = Body;
+							if (content_remains == 0) {
+								on_finish();
+								reset();
+							}
+						} else {
+							//TODO: parse "name: [space] value" or "[space] continuation-value"
+						}
+					}
+					line = ""; //clear line, now that it's parsed
+				}
+			} else if (mode == Body) {
+				assert(content_remains == 0);
+				body += *c;
+				--content_remains;
+				if (content_remains == 0) {
+					on_finish();
+					reset();
+				}
+			}
+		}
+		return true;
+	}
+};
+
 struct client {
-	int socket;
+	http::socket socket;
 	std::shared_ptr< message > first_message;
+	http::incoming_request incoming_request;
 };
 
 inline void server::listen(uint16_t port) {
@@ -193,33 +247,162 @@ inline void server::listen(uint16_t port) {
 			return;
 		}
 	}
+	{ //listen on socket
+		int ret = ::listen(listen_socket, 5);
+		if (ret < 0) {
+			std::cerr << "[server::listen] Failed to listen on socket." << std::endl;
+			closesocket(listen_socket);
+			listen_socket = INVALID_SOCKET;
+			return;
+		}
+	}
+
 
 	std::cout << "[server::listen] Server started at localhost:" << port << "." << std::endl;
-
 
 	//----------- end socket setup -----------
 
 
-	//TODO: set up port and such.
-
 	while (!quit_flag) {
 
+		fd_set read_fds, write_fds;
+		FD_ZERO(&read_fds);
+		FD_ZERO(&write_fds);
+
+		#ifndef _WIN32
+		int max = listen_socket;
+		#endif
+		FD_SET(listen_socket, &read_fds);
+
+		//TODO: wake_socket
+
 		for (auto c : clients) {
-			//TODO: add to read fds, error fds
+			#ifndef _WIN32
+			max = std::max(max, c.socket);
+			#endif
+			FD_SET(c.socket, &read_fds);
 			if (c.first_message && c.first_message->ready) {
-				//TODO: add to write fds
+				FD_SET(c.socket, &write_fds);
 			}
 		}
 		lock.unlock();
 
-		//TODO: select()
+		{ //wait (a bit) for sockets data to become available:
+			struct timeval timeout;
+			timeout.tv_sec = 1; //1sec polling... kinda slow, but eventually will have wake_socket
+			timeout.tv_usec = 0;
+			#ifdef _WIN32
+			//On windows nfds is ignored -- ttps://msdn.microsoft.com/en-us/library/windows/desktop/ms740141(v=vs.85).aspx
+			int ret = select(InvalidSocket, &read_fds, &write_fds, NULL, &timeout);
+			#else
+			int ret = select(max + 1, &read_fds, &write_fds, NULL, &timeout);
+			#endif
 
-		lock.lock();
+			if (ret < 0) {
+				std::cerr << "[server::listen] Select returned an error; will attempt to read/write anyway." << std::endl;
+			} else if (ret == 0) {
+				//nothing to read or write.
+			}
+		}
 
-		//TODO: figure out what can be written to or read from.
+		//add new clients as needed:
+		if (FD_ISSET(listen_socket, &read_fds)) {
+			socket got = accept(listen_socket, NULL, NULL);
+			#ifdef _WIN32
+			if (got == InvalidSocket) {
+			#else
+			if (got < 0) {
+			#endif
+				//oh well.
+			} else {
+				#ifdef _WIN32
+				unsigned long one = 1;
+				if (0 == ioctlsocket(got, FIONBIO, &one)) {
+				#else
+				{
+				#endif
+					clients.emplace_back();
+					clients.back().socket = got;
+					std::cerr << "[server::listen] client connected on " << clients.back().socket << "." << std::endl; //INFO
+				}
+			}
+		}
 
+		lock.lock(); //note: need this for client writes, but not for client reads. Ah, well.
+
+		//process clients:
+		for (auto &c : clients) {
+			//read:
+			if (FD_ISSET(c.socket, &read_fds)) {
+				const uint32_t BufferSize = 40000;
+				static char *buf = new char[BufferSize];
+				#ifdef _WIN32
+				ssize_t ret = recv(c.socket, buf, BufferSize, 0);
+				#else
+				ssize_t ret = recv(c.socket, buf, BufferSize, MSG_DONTWAIT);
+				#endif
+				if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+					//~no problem~ but no data
+				} else if (ret <= 0 || ret > (ssize_t)BufferSize) {
+					//~problem~ so remove client
+					if (ret == 0) {
+						std::cerr << "[http::server] port closed, disconnecting." << std::endl;
+					} else if (ret < 0) {
+						std::cerr << "[http::server] recv() returned error " << errno << ", disconnecting." << std::endl;
+					} else {
+						std::cerr << "[http::server] recv() returned strange number of bytes, disconnecting." << std::endl;
+					}
+					closesocket(c.socket);
+					c.socket = -1;
+					continue; //don't need to process writes
+				} else { //ret > 0
+					bool r = c.incoming_request.parse_bytes(buf, ret, [&](){
+						std::cout << "Parsed a request." << std::endl; //DEBUG
+						//TODO: make response slot, call handle_request
+					});
+					if (!r) {
+						std::cerr << "[http::server] Failed parsing request, closing connection." << std::endl;
+						closesocket(c.socket);
+						c.socket = -1;
+						continue; //don't need to process writes
+					}
+				}
+			}
+			//write:
+			if (FD_ISSET(c.socket, &write_fds) && c.first_message && c.first_message->ready) {
+				std::string &data = c.first_message->data;
+				#ifdef _WIN32
+				ssize_t ret = send(c.socket, data.data(), data.size(), 0);
+				#else
+				ssize_t ret = send(c.socket, data.data(), data.size(), MSG_DONTWAIT);
+				#endif
+				if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+					//~no problem~
+				} else if (ret <= 0 || ret > (ssize_t)data.size()) {
+					if (ret < 0) {
+						std::cerr << "[http::server] send() returned error " << errno << ", disconnecting." << std::endl;
+					} else { assert(ret == 0 || ret > (ssize_t)data.size());
+						std::cerr << "[http::server] send() returned strange number of bytes, disconnecting." << std::endl;
+					}
+					closesocket(c.socket);
+					c.socket = -1;
+				} else { //ret seems reasonable
+					data.erase(0, ret);
+				}
+			}
+		}
+
+		//reap closed clients:
+		for (auto client = clients.begin(); client != clients.end(); /*later*/) {
+			auto old = client;
+			++client;
+			if (old->socket == INVALID_SOCKET) {
+				clients.erase(old);
+			}
+		}
 
 	}
+
 	running = false;
 	cv.notify_all();
 }
