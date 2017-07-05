@@ -9,9 +9,12 @@
  * http::server server;
  *
  * server.handle_request = [](http::request const &request, std::unique_ptr< http::response > response){
- *   if (request.url == '/') {
- *       if (request.method
- *       response.body = ;
+ *   if (request.method == "GET" && request.url == "/") {
+ *       response->body = "<html><body>Hello World.</body></html>";
+ *   } else {
+ *       response->status.code = 404;
+ *       response->status.message = "Not Found";
+ *       response->body = "<html><body>Not Found</body></html>";
  *   }
  *   -> 'response' is sent to client when destroyed, so std::move() it if you want to leave response outstanding for a while
  * };
@@ -122,6 +125,19 @@ struct message {
 	std::shared_ptr< message > next;
 };
 
+//case-insensitive equality for header field names (also, ugh, that was a mistake in the spec):
+inline bool case_insensitive_equals(std::string const &a, std::string const &b) {
+	if (a.size() != b.size()) return false;
+	for (uint32_t i = 0; i < a.size(); ++i) {
+		char ca = a[i];
+		char cb = b[i];
+		if (ca >= 'A' && ca <= 'Z') ca |= 0x20;
+		if (cb >= 'A' && cb <= 'Z') cb |= 0x20;
+		if (ca != cb) return false;
+	}
+	return true;
+}
+
 struct incoming_request : request {
 	//state == line curently being recv'd
 	enum {
@@ -140,30 +156,88 @@ struct incoming_request : request {
 			if (mode == RequestLine || mode == HeaderLine) {
 				line += *c;
 				//at end-of-line, do something:
-				if (line.size() > 2 && line[line.size() - 2] == '\r' && line[line.size()-1] == '\n') {
+				if (line.size() >= 2 && line[line.size() - 2] == '\r' && line[line.size()-1] == '\n') {
 					line.erase(line.size()-2); //trim CRLF
+					std::cout << "line '" << line << "'" << std::endl; //DEBUG
 					if (mode == RequestLine) {
 						if (line.size() == 0) {
 							//ignore empty line before request
 						} else {
-							//TODO: parse "method SP url SP version"
+							//parse "method SP url SP version"
+							auto i1 = line.find(' ');
+							if (i1 == std::string::npos) return false;
+							auto i2 = line.find(' ', i1+1);
+							if (i1 == std::string::npos) return false;
+							method = line.substr(0, i1);
+							url = line.substr(i1+1, i2-(i1+1));
+							std::string version = line.substr(i2+1);
+							if (version.substr(0,7) != "HTTP/1.") return false; //unsupported http version
+
+							std::cout << ". request '" << method << "' '" << url << "' '" << version << "'" << std::endl; //DEBUG
+
+							mode = HeaderLine;
 						}
 					} else { assert(mode == HeaderLine);
 						if (line.size() == 0) {
 							//empty line between headers and body!
+
+							std::cout << "[ end of headers ]" << std::endl; //DEBUG
+
+							//clean up headers by trimming whitespace as per the spec:
+							for (auto &nf : headers) {
+								std::string value = "";
+								//replace runs of ' '/'\t' with single ' ' (and ignore first such run):
+								for (auto const &c : nf.second) {
+									if (c == ' ' || c == '\t') {
+										if (!value.empty() && value[value.size()-1] != ' ') {
+											value += ' ';
+										}
+									} else {
+										value += c;
+									}
+								}
+								if (!value.empty() && value[value.size()-1] == ' ') value = value.substr(0, value.size()-1);
+								std::cout << "field '" << nf.first << "' had value '" << nf.second << "' canonicalized to '" << value << "'" << std::endl; //DEBUG
+								nf.second = value;
+							}
+
+							//set content_remains based on size of body passed in content header:
+							for (auto const &nf : headers) {
+								if (case_insensitive_equals(nf.first, "Content-Length")) {
+									content_remains = std::stoul(nf.second);
+								}
+							}
+
 							mode = Body;
 							if (content_remains == 0) {
 								on_finish();
 								reset();
 							}
 						} else {
-							//TODO: parse "name: [space] value" or "[space] continuation-value"
+							//parse "name: [space] value" or "[space] continuation-value"
+							if (line[0] == ' ' || line[0] == '\t') {
+								//[space] continuation-value
+								if (headers.empty()) {
+									std::cout << " !! nothing to continue" << std::endl; //DEBUG
+									return false; //nothing to continue
+								}
+								std::cout << ". continue '" << line << "'" << std::endl; //DEBUG
+								headers.back().second += line;
+							} else {
+								auto i = line.find(':');
+								if (i == std::string::npos) {
+									std::cout << " !! no ':'" << std::endl; //DEBUG
+									return false; //no ':' to split field name and value
+								}
+								headers.emplace_back(line.substr(0, i), line.substr(i+1));
+								std::cout << ". header '" << headers.back().first << "' '" << headers.back().second << "'" << std::endl; //DEBUG
+							}
 						}
 					}
 					line = ""; //clear line, now that it's parsed
 				}
 			} else if (mode == Body) {
-				assert(content_remains == 0);
+				assert(content_remains != 0);
 				body += *c;
 				--content_remains;
 				if (content_remains == 0) {
@@ -172,6 +246,7 @@ struct incoming_request : request {
 				}
 			}
 		}
+		std::cout << "trailing: '" << line << "'" << std::endl; //DEBUG
 		return true;
 	}
 };
@@ -358,7 +433,21 @@ inline void server::listen(uint16_t port) {
 				} else { //ret > 0
 					bool r = c.incoming_request.parse_bytes(buf, ret, [&](){
 						std::cout << "Parsed a request." << std::endl; //DEBUG
-						//TODO: make response slot, call handle_request
+						std::shared_ptr< message > *message_ptr = &c.first_message;
+						while (message_ptr->get()) {
+							message_ptr = &(message_ptr->get()->next);
+						}
+
+						std::shared_ptr< message > shared_message = std::make_shared< message >();
+
+						std::unique_ptr< response > response(std::make_unique< response >(this, shared_message));
+						response->owner = this;
+						response->weak_message = shared_message;
+
+						*message_ptr = std::move(shared_message);
+						lock.unlock();
+						handle_request( c.incoming_request, std::move(response) );
+						lock.lock();
 					});
 					if (!r) {
 						std::cerr << "[http::server] Failed parsing request, closing connection." << std::endl;
@@ -371,6 +460,8 @@ inline void server::listen(uint16_t port) {
 			//write:
 			if (FD_ISSET(c.socket, &write_fds) && c.first_message && c.first_message->ready) {
 				std::string &data = c.first_message->data;
+				std::cout << "Message " << c.first_message.get() << " contains data:\n" << data << std::endl; //DEBUG
+				assert(data.size() > 0); //DEBUG
 				#ifdef _WIN32
 				ssize_t ret = send(c.socket, data.data(), data.size(), 0);
 				#else
@@ -382,12 +473,16 @@ inline void server::listen(uint16_t port) {
 					if (ret < 0) {
 						std::cerr << "[http::server] send() returned error " << errno << ", disconnecting." << std::endl;
 					} else { assert(ret == 0 || ret > (ssize_t)data.size());
-						std::cerr << "[http::server] send() returned strange number of bytes, disconnecting." << std::endl;
+						std::cerr << "[http::server] send() returned strange number of bytes [" << ret << " of " << data.size() << "], disconnecting." << std::endl;
 					}
 					closesocket(c.socket);
 					c.socket = -1;
 				} else { //ret seems reasonable
 					data.erase(0, ret);
+					if (data.empty()) {
+						//message finished, advance:
+						c.first_message = std::move(c.first_message->next);
+					}
 				}
 			}
 		}
@@ -423,8 +518,8 @@ inline void server::wake() {
 
 inline response::~response() {
 	//does the message slot still exist?
-	std::shared_ptr< message > strong_message = weak_message.lock();
-	if (!strong_message) return;
+	std::shared_ptr< message > shared_message = weak_message.lock();
+	if (!shared_message) return;
 
 	//if so, build the message:
 	std::string message;
@@ -435,11 +530,15 @@ inline response::~response() {
 	message += "Content-Length: " + std::to_string(body.size()) + "\r\n";
 	message += "\r\n";
 	message += body;
+	assert(message.size() > 0);
+
+	std::cerr << "Message for " << shared_message.get() << " gets data:\n" << message << std::endl; //DEBUG
 
 	{ //copy to send queue:
 		std::unique_lock< std::mutex > lock(owner->mutex);
-		strong_message->data = std::move(message);
-		strong_message->ready = true;
+		shared_message->data = std::move(message);
+		shared_message->ready = true;
+		assert(shared_message->data.size() > 0);
 	}
 	//wake server:
 	owner->wake();
