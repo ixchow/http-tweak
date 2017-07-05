@@ -6,38 +6,36 @@
  *
  * Usage:
  * 
- * http::server server;
+ * http::server server(port);
  *
- * server.handle_request = [](http::request const &request, std::unique_ptr< http::response > response){
- *   if (request.method == "GET" && request.url == "/") {
- *       response->body = "<html><body>Hello World.</body></html>";
- *   } else {
- *       response->status.code = 404;
- *       response->status.message = "Not Found";
- *       response->body = "<html><body>Not Found</body></html>";
- *   }
- *   -> 'response' is sent to client when destroyed, so std::move() it if you want to leave response outstanding for a while
- * };
+ * for (;;) {
+ *     server.poll([](http::request const &request, std::unique_ptr< http::response > response){
+ *       if (request.method == "GET" && request.url == "/") {
+ *           response->body = "<html><body>Hello World.</body></html>";
+ *       } else {
+ *           response->status.code = 404;
+ *           response->status.message = "Not Found";
+ *           response->body = "<html><body>Not Found</body></html>";
+ *       }
+ *       //'response' is sent to client during the next poll() after destroyed, so std::move() it if you want to leave response outstanding for a while
+ *    }, 1.0);
+ * }
  *
- * server.listen(port);
  *
  * Thread-safety:
- *  - server doesn't use threads; it's select()-based.
- *  - server will call handle_request from the thread that called 'listen'
- *  - it is safe to pass ownership of a response to another thread (as long as you make sure it doesn't outlive the server)
- *  - it is safe to call server.stop() from another thread. (again, make sure the other thread's reference doesn't outlive the server)
- *
+ *  - don't call 'poll()' from within 'poll()'
+ *  - don't call 'poll()' from multiple threads at once
+ *  - it is safe to pass ownership of a response to another thread, even if it outlives the server
  *
  */
 
+#include <cmath>
 #include <string>
 #include <vector>
 #include <functional>
 #include <memory>
-#include <mutex>
-#include <thread>
+#include <atomic>
 #include <cassert>
-#include <condition_variable>
 #include <list>
 #include <iostream>
 
@@ -87,7 +85,6 @@ struct response {
 
 	//------ internals ------
 	std::weak_ptr< message > weak_message;
-	server *owner;
 	~response();
 };
 
@@ -100,30 +97,28 @@ const socket INVALID_SOCKET = -1;
 #endif
 
 struct server {
-	std::function< void(request &, std::unique_ptr< response > response) > handle_request;
-	void listen(uint16_t port);
-	void stop();
+	server(uint16_t port);
+	~server();
+
+	//receive data, pass any new requests to handle_request, and send any pending responses:
+	// (timeout is in seconds, and is how long poll() will wait for activity before returning)
+	void poll(std::function< void(request &, std::unique_ptr< response > response) > const &handle_request, double timeout = 0.0);
 
 	//------- internals -------
-	std::mutex mutex;
-	bool quit_flag = false;
-	bool running = false;
-	std::condition_variable cv; //used to block/notify threads calling
-	socket wake_socket = INVALID_SOCKET; //used to wake from select() as needed
-	struct sockaddr_in wake_addr; //used to send to wake_socket
-
-	void wake(); //used to poke server when blocking on select()
-
+	socket listen_socket = INVALID_SOCKET;
 	std::list< client > clients;
+	bool polling = false;
 };
 
 
 //------ internals ------
 
 struct message {
-	bool ready = false;
+	std::atomic< bool > ready;
 	std::string data;
 	std::shared_ptr< message > next;
+
+	message() : ready(false) { }
 };
 
 //case-insensitive equality for header field names (also, ugh, that was a mistake in the spec):
@@ -248,12 +243,7 @@ struct client {
 	http::incoming_request incoming_request;
 };
 
-inline void server::listen(uint16_t port) {
-	std::unique_lock< std::mutex > lock(mutex);
-	if (quit_flag) return; //don't bother starting up if already instructed to quit
-	running = true;
-
-	int listen_socket = -1;
+inline server::server(uint16_t port) {
 
 	#ifdef _WIN32
 	static bool inited = [](){
@@ -266,57 +256,16 @@ inline void server::listen(uint16_t port) {
 		}
 	}();
 	if (!inited) {
-		std::cerr << "[server::listen] ERROR: WSAStartup failed." << std::endl;
+		std::cerr << "[server::server] ERROR: WSAStartup failed." << std::endl;
 		return;
 	}
 	#endif
-	//----------- socket setup (wake socket) -----------
-	{
-		wake_socket = ::socket(AF_INET, SOCK_DGRAM, 0);
-		if (wake_socket == -1) {
-			std::cerr << "Failed to create UDP wake-up socket." << std::endl;
-			return;
-		}
-	}
-	{ //bind to address
-		struct sockaddr_in addr;
-		memset(&addr, 0, sizeof(addr));
-		addr.sin_family = AF_INET;
-		addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-		addr.sin_port = htons(0);
-		int ret = bind(wake_socket, reinterpret_cast< sockaddr * >(&addr), sizeof(addr));
-		if (ret < 0) {
-			#ifdef WINDOWS
-			static char buffer[1000];
-			if (0 != strerror_s(buffer, errno)) {
-				buffer[0] = '\0';
-			}
-			std::cerr << "[server::listen] Failed to bind wake-up socket (" << buffer << ")" << std::endl;
-			#else
-			std::cerr << "[server::listen] Failed to bind wake-up socket (" << strerror(errno) << ")" << std::endl;
-			#endif
-			closesocket(wake_socket);
-			wake_socket = INVALID_SOCKET;
-			return;
-		}
-	}
-	{ //read back address:
-		memset(&wake_addr, 0, sizeof(wake_addr));
-		socklen_t addrlen = sizeof(wake_addr);
-		int ret = getsockname(wake_socket, reinterpret_cast< sockaddr * >(&wake_addr), &addrlen);
-		if (ret < 0) {
-			std::cerr << "[server::listen] Failed to read address of wake-up socket (" << errno << ")" << std::endl;
-			return;
-		}
-		std::cerr << "FYI, wake port is " << ntohs(wake_addr.sin_port) << std::endl; //DEBUG
-	}
 
 	//----------- socket setup -----------
 	{ //create socket:
 		listen_socket = ::socket(AF_INET, SOCK_STREAM, 0);
 		if (listen_socket == -1) {
-			std::cerr << "Failed to create socket." << std::endl;
-			return;
+			throw std::system_error(errno, std::system_category(), "failed to create socket");
 		}
 	}
 	{ //make it okay to reuse port:
@@ -328,7 +277,7 @@ inline void server::listen(uint16_t port) {
 		int ret = setsockopt(listen_socket, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 	#endif
 		if (ret != 0) {
-			std::cerr << "[server::listen] ERROR: Failed to set socket reuse address." << std::endl;
+			std::cerr << "[server::server] WARNING: Failed to set socket reuse address." << std::endl;
 		}
 	}
 	{ //bind to address
@@ -339,241 +288,181 @@ inline void server::listen(uint16_t port) {
 		addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 		int ret = bind(listen_socket, reinterpret_cast< sockaddr * >(&addr), sizeof(addr));
 		if (ret < 0) {
-			#ifdef WINDOWS
-			static char buffer[1000];
-			if (0 != strerror_s(buffer, errno)) {
-				buffer[0] = '\0';
-			}
-			std::cerr << "[server::listen] Failed to bind socket (" << buffer << ")" << std::endl;
-			#else
-			std::cerr << "[server::listen] Failed to bind socket (" << strerror(errno) << ")" << std::endl;
-			#endif
 			closesocket(listen_socket);
-			listen_socket = INVALID_SOCKET;
-			return;
+			throw std::system_error(errno, std::system_category(), "failed to bind socket");
 		}
 	}
 	{ //listen on socket
 		int ret = ::listen(listen_socket, 5);
 		if (ret < 0) {
-			std::cerr << "[server::listen] Failed to listen on socket." << std::endl;
 			closesocket(listen_socket);
-			listen_socket = INVALID_SOCKET;
+			throw std::system_error(errno, std::system_category(), "failed to listen on socket");
+		}
+	}
+
+
+	std::cout << "[server::server] Server started at localhost:" << port << "." << std::endl;
+}
+
+inline server::~server() {
+	closesocket(listen_socket);
+}
+
+inline void server::poll(std::function< void(request &, std::unique_ptr< response > response) > const &handle_request, double timeout) {
+	assert(!polling && "You must not call server.poll() from within a server.poll() callback.");
+
+	polling = true;
+
+	fd_set read_fds, write_fds;
+	FD_ZERO(&read_fds);
+	FD_ZERO(&write_fds);
+
+	int max = listen_socket;
+	FD_SET(listen_socket, &read_fds);
+
+	for (auto c : clients) {
+		max = std::max(max, c.socket);
+		FD_SET(c.socket, &read_fds);
+		if (c.first_message && c.first_message->ready.load(std::memory_order_acquire)) {
+			FD_SET(c.socket, &write_fds);
+		}
+	}
+
+	{ //wait (a bit) for sockets' data to become available:
+		struct timeval tv;
+		tv.tv_sec = std::lround(std::floor(timeout));
+		tv.tv_usec = std::lround((timeout - std::floor(timeout)) * 1e6);
+		#ifdef _WIN32
+		//On windows nfds is ignored -- https://msdn.microsoft.com/en-us/library/windows/desktop/ms740141(v=vs.85).aspx
+		//needed? (void)max; //suppress unused variable warning
+		int ret = select(InvalidSocket, &read_fds, &write_fds, NULL, &tv);
+		#else
+		int ret = select(max + 1, &read_fds, &write_fds, NULL, &tv);
+		#endif
+
+		if (ret < 0) {
+			std::cerr << "[server::poll] Select returned an error; will attempt to read/write anyway." << std::endl;
+		} else if (ret == 0) {
+			//nothing to read or write.
+			polling = false;
 			return;
 		}
 	}
 
-
-	std::cout << "[server::listen] Server started at localhost:" << port << "." << std::endl;
-
-	//----------- end socket setup -----------
-
-
-	while (!quit_flag) {
-
-		fd_set read_fds, write_fds;
-		FD_ZERO(&read_fds);
-		FD_ZERO(&write_fds);
-
-		#ifndef _WIN32
-		int max = listen_socket;
-		#endif
-		FD_SET(listen_socket, &read_fds);
-
-		max = std::max(max, wake_socket);
-		FD_SET(wake_socket, &read_fds);
-
-		for (auto c : clients) {
-			#ifndef _WIN32
-			max = std::max(max, c.socket);
-			#endif
-			FD_SET(c.socket, &read_fds);
-			if (c.first_message && c.first_message->ready) {
-				FD_SET(c.socket, &write_fds);
-			}
-		}
-		lock.unlock();
-
-		{ //wait (a bit) for sockets data to become available:
-			struct timeval timeout;
-			timeout.tv_sec = 1; //1sec polling... kinda slow, but eventually will have wake_socket
-			timeout.tv_usec = 0;
-			#ifdef _WIN32
-			//On windows nfds is ignored -- ttps://msdn.microsoft.com/en-us/library/windows/desktop/ms740141(v=vs.85).aspx
-			int ret = select(InvalidSocket, &read_fds, &write_fds, NULL, &timeout);
-			#else
-			int ret = select(max + 1, &read_fds, &write_fds, NULL, &timeout);
-			#endif
-
-			if (ret < 0) {
-				std::cerr << "[server::listen] Select returned an error; will attempt to read/write anyway." << std::endl;
-			} else if (ret == 0) {
-				//nothing to read or write.
-			}
-		}
-
-		//clear wake-up messages as needed:
-		if (FD_ISSET(wake_socket, &read_fds)) {
-			std::cout << "got 'wake' message" << std::endl; //DEBUG
-			const uint32_t BufferSize = 100;
-			static char *buf = new char[BufferSize];
-			#ifdef _WIN32
-			recv(wake_socket, buf, BufferSize, 0);
-			#else
-			recv(wake_socket, buf, BufferSize, MSG_DONTWAIT);
-			#endif
-			//...(ignore contents)...
-		}
-
-		//add new clients as needed:
-		if (FD_ISSET(listen_socket, &read_fds)) {
-			socket got = accept(listen_socket, NULL, NULL);
-			#ifdef _WIN32
-			if (got == InvalidSocket) {
-			#else
-			if (got < 0) {
-			#endif
-				//oh well.
-			} else {
-				#ifdef _WIN32
-				unsigned long one = 1;
-				if (0 == ioctlsocket(got, FIONBIO, &one)) {
-				#else
-				{
-				#endif
-					clients.emplace_back();
-					clients.back().socket = got;
-					std::cerr << "[server::listen] client connected on " << clients.back().socket << "." << std::endl; //INFO
-				}
-			}
-		}
-
-		lock.lock(); //note: need this for client writes, but not for client reads. Ah, well.
-
-		//process clients:
-		for (auto &c : clients) {
-			//read:
-			if (FD_ISSET(c.socket, &read_fds)) {
-				const uint32_t BufferSize = 40000;
-				static char *buf = new char[BufferSize];
-				#ifdef _WIN32
-				ssize_t ret = recv(c.socket, buf, BufferSize, 0);
-				#else
-				ssize_t ret = recv(c.socket, buf, BufferSize, MSG_DONTWAIT);
-				#endif
-				if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-					//~no problem~ but no data
-				} else if (ret <= 0 || ret > (ssize_t)BufferSize) {
-					//~problem~ so remove client
-					if (ret == 0) {
-						std::cerr << "[http::server] port closed, disconnecting." << std::endl;
-					} else if (ret < 0) {
-						std::cerr << "[http::server] recv() returned error " << errno << ", disconnecting." << std::endl;
-					} else {
-						std::cerr << "[http::server] recv() returned strange number of bytes, disconnecting." << std::endl;
-					}
-					closesocket(c.socket);
-					c.socket = -1;
-					continue; //don't need to process writes
-				} else { //ret > 0
-					bool r = c.incoming_request.parse_bytes(buf, ret, [&](){
-						std::cout << "Parsed a request." << std::endl; //DEBUG
-						std::shared_ptr< message > *message_ptr = &c.first_message;
-						while (message_ptr->get()) {
-							message_ptr = &(message_ptr->get()->next);
-						}
-
-						std::shared_ptr< message > shared_message = std::make_shared< message >();
-
-						std::unique_ptr< response > response(std::make_unique< response >());
-						response->owner = this;
-						response->weak_message = shared_message;
-
-						*message_ptr = std::move(shared_message);
-						lock.unlock();
-						handle_request( c.incoming_request, std::move(response) );
-						lock.lock();
-					});
-					if (!r) {
-						std::cerr << "[http::server] Failed parsing request, closing connection." << std::endl;
-						closesocket(c.socket);
-						c.socket = -1;
-						continue; //don't need to process writes
-					}
-				}
-			}
-			//write:
-			if (FD_ISSET(c.socket, &write_fds) && c.first_message && c.first_message->ready) {
-				std::string &data = c.first_message->data;
-				#ifdef _WIN32
-				ssize_t ret = send(c.socket, data.data(), data.size(), 0);
-				#else
-				ssize_t ret = send(c.socket, data.data(), data.size(), MSG_DONTWAIT);
-				#endif
-				if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-					//~no problem~
-				} else if (ret <= 0 || ret > (ssize_t)data.size()) {
-					if (ret < 0) {
-						std::cerr << "[http::server] send() returned error " << errno << ", disconnecting." << std::endl;
-					} else { assert(ret == 0 || ret > (ssize_t)data.size());
-						std::cerr << "[http::server] send() returned strange number of bytes [" << ret << " of " << data.size() << "], disconnecting." << std::endl;
-					}
-					closesocket(c.socket);
-					c.socket = -1;
-				} else { //ret seems reasonable
-					data.erase(0, ret);
-					if (data.empty()) {
-						//message finished, advance:
-						c.first_message = std::move(c.first_message->next);
-					}
-				}
-			}
-		}
-
-		//reap closed clients:
-		for (auto client = clients.begin(); client != clients.end(); /*later*/) {
-			auto old = client;
-			++client;
-			if (old->socket == INVALID_SOCKET) {
-				clients.erase(old);
-			}
-		}
-
-	}
-
-	closesocket(listen_socket);
-	listen_socket = INVALID_SOCKET;
-
-	closesocket(wake_socket);
-	wake_socket = INVALID_SOCKET;
-
-	running = false;
-	cv.notify_all();
-}
-
-
-//This is a bad idea, because stop() can't be called from handle_request [deadlock], and it can't be called from a different thread [because the mutex gets deallocated, potentially, after the server stops]:
-inline void server::stop() {
-	std::unique_lock< std::mutex > lock(mutex);
-	quit_flag = true;
-	//if stop() is called during listen(), waits for listen() to quit, otherwise returns immediately:
-	if (running) {
-		cv.wait(lock);
-		assert(!running);
-	}
-}
-
-inline void server::wake() {
-	//poke wake_socket with a one byte datagram:
-	std::unique_lock< std::mutex > lock(mutex);
-	if (wake_socket != INVALID_SOCKET) {
-		std::string data = "!";
+	//add new clients as needed:
+	if (FD_ISSET(listen_socket, &read_fds)) {
+		socket got = accept(listen_socket, NULL, NULL);
 		#ifdef _WIN32
-		sendto(wake_socket, data.data(), data.size(), 0, reinterpret_cast< sockaddr * >(&wake_addr), sizeof(wake_addr));
+		if (got == INVALID_SOCKET) {
 		#else
-		sendto(wake_socket, data.data(), data.size(), MSG_DONTWAIT, reinterpret_cast< sockaddr * >(&wake_addr), sizeof(wake_addr));
+		if (got < 0) {
 		#endif
+			//oh well.
+		} else {
+			#ifdef _WIN32
+			unsigned long one = 1;
+			if (0 == ioctlsocket(got, FIONBIO, &one)) {
+			#else
+			{
+			#endif
+				clients.emplace_back();
+				clients.back().socket = got;
+				std::cerr << "[server::poll] client connected on " << clients.back().socket << "." << std::endl; //INFO
+			}
+		}
 	}
+
+
+	//process requests:
+	for (auto &c : clients) {
+		if (!FD_ISSET(c.socket, &read_fds)) continue; //don't bother if not marked readable
+
+		const uint32_t BufferSize = 40000;
+		static char *buf = new char[BufferSize];
+		#ifdef _WIN32
+		ssize_t ret = recv(c.socket, buf, BufferSize, 0);
+		#else
+		ssize_t ret = recv(c.socket, buf, BufferSize, MSG_DONTWAIT);
+		#endif
+		if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+			//~no problem~ but no data
+		} else if (ret <= 0 || ret > (ssize_t)BufferSize) {
+			//~problem~ so remove client
+			if (ret == 0) {
+				std::cerr << "[server::poll] port closed, disconnecting." << std::endl;
+			} else if (ret < 0) {
+				std::cerr << "[server::poll] recv() returned error " << errno << ", disconnecting." << std::endl;
+			} else {
+				std::cerr << "[server::poll] recv() returned strange number of bytes, disconnecting." << std::endl;
+			}
+			closesocket(c.socket);
+			c.socket = INVALID_SOCKET;
+		} else { //ret > 0
+			bool r = c.incoming_request.parse_bytes(buf, ret, [&](){
+
+				std::shared_ptr< message > *message_ptr = &c.first_message;
+				while (message_ptr->get()) {
+					message_ptr = &(message_ptr->get()->next);
+				}
+
+				std::shared_ptr< message > shared_message = std::make_shared< message >();
+
+				std::unique_ptr< response > response(std::make_unique< response >());
+				response->weak_message = shared_message;
+
+				*message_ptr = std::move(shared_message);
+				handle_request( c.incoming_request, std::move(response) );
+			});
+			if (!r) {
+				std::cerr << "[server::poll] Failed parsing request, closing connection." << std::endl;
+				closesocket(c.socket);
+				c.socket = INVALID_SOCKET;
+			}
+		}
+	}
+
+	//process responses:
+	for (auto &c : clients) {
+		if (c.socket == INVALID_SOCKET) continue; //will reap later
+		if (!FD_ISSET(c.socket, &write_fds)) continue; //don't bother if not marked writable
+		while (c.first_message && c.first_message->ready.load(std::memory_order_acquire)) {
+			std::string &data = c.first_message->data;
+			#ifdef _WIN32
+			ssize_t ret = send(c.socket, data.data(), data.size(), 0);
+			#else
+			ssize_t ret = send(c.socket, data.data(), data.size(), MSG_DONTWAIT);
+			#endif
+			if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+				//~no problem~, but don't keep trying
+				break;
+			} else if (ret <= 0 || ret > (ssize_t)data.size()) {
+				if (ret < 0) {
+					std::cerr << "[server::poll] send() returned error " << errno << ", disconnecting." << std::endl;
+				} else { assert(ret == 0 || ret > (ssize_t)data.size());
+					std::cerr << "[server::poll] send() returned strange number of bytes [" << ret << " of " << data.size() << "], disconnecting." << std::endl;
+				}
+				closesocket(c.socket);
+				c.socket = INVALID_SOCKET;
+			} else { //ret seems reasonable
+				data.erase(0, ret);
+				if (data.empty()) {
+					//message finished, advance:
+					c.first_message = std::move(c.first_message->next);
+				}
+			}
+		}
+	}
+
+	//reap closed clients:
+	for (auto client = clients.begin(); client != clients.end(); /*later*/) {
+		auto old = client;
+		++client;
+		if (old->socket == INVALID_SOCKET) {
+			clients.erase(old);
+		}
+	}
+
+	polling = false;
 }
 
 inline response::~response() {
@@ -591,14 +480,11 @@ inline response::~response() {
 	message += "\r\n";
 	message += body;
 
-	{ //copy to send queue:
-		std::unique_lock< std::mutex > lock(owner->mutex);
+	{ //mark ready to send:
 		shared_message->data = std::move(message);
-		shared_message->ready = true;
+		shared_message->ready.store(true, std::memory_order_release);
 	}
 
-	//wake server:
-	owner->wake();
 }
 
 
