@@ -110,6 +110,7 @@ struct server {
 	bool running = false;
 	std::condition_variable cv; //used to block/notify threads calling
 	socket wake_socket = INVALID_SOCKET; //used to wake from select() as needed
+	struct sockaddr_in wake_addr; //used to send to wake_socket
 
 	void wake(); //used to poke server when blocking on select()
 
@@ -158,7 +159,7 @@ struct incoming_request : request {
 				//at end-of-line, do something:
 				if (line.size() >= 2 && line[line.size() - 2] == '\r' && line[line.size()-1] == '\n') {
 					line.erase(line.size()-2); //trim CRLF
-					std::cout << "line '" << line << "'" << std::endl; //DEBUG
+
 					if (mode == RequestLine) {
 						if (line.size() == 0) {
 							//ignore empty line before request
@@ -173,15 +174,11 @@ struct incoming_request : request {
 							std::string version = line.substr(i2+1);
 							if (version.substr(0,7) != "HTTP/1.") return false; //unsupported http version
 
-							std::cout << ". request '" << method << "' '" << url << "' '" << version << "'" << std::endl; //DEBUG
-
 							mode = HeaderLine;
 						}
 					} else { assert(mode == HeaderLine);
 						if (line.size() == 0) {
 							//empty line between headers and body!
-
-							std::cout << "[ end of headers ]" << std::endl; //DEBUG
 
 							//clean up headers by trimming whitespace as per the spec:
 							for (auto &nf : headers) {
@@ -197,7 +194,6 @@ struct incoming_request : request {
 									}
 								}
 								if (!value.empty() && value[value.size()-1] == ' ') value = value.substr(0, value.size()-1);
-								std::cout << "field '" << nf.first << "' had value '" << nf.second << "' canonicalized to '" << value << "'" << std::endl; //DEBUG
 								nf.second = value;
 							}
 
@@ -218,19 +214,15 @@ struct incoming_request : request {
 							if (line[0] == ' ' || line[0] == '\t') {
 								//[space] continuation-value
 								if (headers.empty()) {
-									std::cout << " !! nothing to continue" << std::endl; //DEBUG
 									return false; //nothing to continue
 								}
-								std::cout << ". continue '" << line << "'" << std::endl; //DEBUG
 								headers.back().second += line;
 							} else {
 								auto i = line.find(':');
 								if (i == std::string::npos) {
-									std::cout << " !! no ':'" << std::endl; //DEBUG
 									return false; //no ':' to split field name and value
 								}
 								headers.emplace_back(line.substr(0, i), line.substr(i+1));
-								std::cout << ". header '" << headers.back().first << "' '" << headers.back().second << "'" << std::endl; //DEBUG
 							}
 						}
 					}
@@ -246,7 +238,6 @@ struct incoming_request : request {
 				}
 			}
 		}
-		std::cout << "trailing: '" << line << "'" << std::endl; //DEBUG
 		return true;
 	}
 };
@@ -279,6 +270,46 @@ inline void server::listen(uint16_t port) {
 		return;
 	}
 	#endif
+	//----------- socket setup (wake socket) -----------
+	{
+		wake_socket = ::socket(AF_INET, SOCK_DGRAM, 0);
+		if (wake_socket == -1) {
+			std::cerr << "Failed to create UDP wake-up socket." << std::endl;
+			return;
+		}
+	}
+	{ //bind to address
+		struct sockaddr_in addr;
+		memset(&addr, 0, sizeof(addr));
+		addr.sin_family = AF_INET;
+		addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		addr.sin_port = htons(0);
+		int ret = bind(wake_socket, reinterpret_cast< sockaddr * >(&addr), sizeof(addr));
+		if (ret < 0) {
+			#ifdef WINDOWS
+			static char buffer[1000];
+			if (0 != strerror_s(buffer, errno)) {
+				buffer[0] = '\0';
+			}
+			std::cerr << "[server::listen] Failed to bind wake-up socket (" << buffer << ")" << std::endl;
+			#else
+			std::cerr << "[server::listen] Failed to bind wake-up socket (" << strerror(errno) << ")" << std::endl;
+			#endif
+			closesocket(wake_socket);
+			wake_socket = INVALID_SOCKET;
+			return;
+		}
+	}
+	{ //read back address:
+		memset(&wake_addr, 0, sizeof(wake_addr));
+		socklen_t addrlen = sizeof(wake_addr);
+		int ret = getsockname(wake_socket, reinterpret_cast< sockaddr * >(&wake_addr), &addrlen);
+		if (ret < 0) {
+			std::cerr << "[server::listen] Failed to read address of wake-up socket (" << errno << ")" << std::endl;
+			return;
+		}
+		std::cerr << "FYI, wake port is " << ntohs(wake_addr.sin_port) << std::endl; //DEBUG
+	}
 
 	//----------- socket setup -----------
 	{ //create socket:
@@ -349,7 +380,8 @@ inline void server::listen(uint16_t port) {
 		#endif
 		FD_SET(listen_socket, &read_fds);
 
-		//TODO: wake_socket
+		max = std::max(max, wake_socket);
+		FD_SET(wake_socket, &read_fds);
 
 		for (auto c : clients) {
 			#ifndef _WIN32
@@ -378,6 +410,19 @@ inline void server::listen(uint16_t port) {
 			} else if (ret == 0) {
 				//nothing to read or write.
 			}
+		}
+
+		//clear wake-up messages as needed:
+		if (FD_ISSET(wake_socket, &read_fds)) {
+			std::cout << "got 'wake' message" << std::endl; //DEBUG
+			const uint32_t BufferSize = 100;
+			static char *buf = new char[BufferSize];
+			#ifdef _WIN32
+			recv(wake_socket, buf, BufferSize, 0);
+			#else
+			recv(wake_socket, buf, BufferSize, MSG_DONTWAIT);
+			#endif
+			//...(ignore contents)...
 		}
 
 		//add new clients as needed:
@@ -440,7 +485,7 @@ inline void server::listen(uint16_t port) {
 
 						std::shared_ptr< message > shared_message = std::make_shared< message >();
 
-						std::unique_ptr< response > response(std::make_unique< response >(this, shared_message));
+						std::unique_ptr< response > response(std::make_unique< response >());
 						response->owner = this;
 						response->weak_message = shared_message;
 
@@ -460,8 +505,6 @@ inline void server::listen(uint16_t port) {
 			//write:
 			if (FD_ISSET(c.socket, &write_fds) && c.first_message && c.first_message->ready) {
 				std::string &data = c.first_message->data;
-				std::cout << "Message " << c.first_message.get() << " contains data:\n" << data << std::endl; //DEBUG
-				assert(data.size() > 0); //DEBUG
 				#ifdef _WIN32
 				ssize_t ret = send(c.socket, data.data(), data.size(), 0);
 				#else
@@ -498,10 +541,18 @@ inline void server::listen(uint16_t port) {
 
 	}
 
+	closesocket(listen_socket);
+	listen_socket = INVALID_SOCKET;
+
+	closesocket(wake_socket);
+	wake_socket = INVALID_SOCKET;
+
 	running = false;
 	cv.notify_all();
 }
 
+
+//This is a bad idea, because stop() can't be called from handle_request [deadlock], and it can't be called from a different thread [because the mutex gets deallocated, potentially, after the server stops]:
 inline void server::stop() {
 	std::unique_lock< std::mutex > lock(mutex);
 	quit_flag = true;
@@ -513,7 +564,16 @@ inline void server::stop() {
 }
 
 inline void server::wake() {
-	//TODO: poke wake_socket with one byte or a datagram or something
+	//poke wake_socket with a one byte datagram:
+	std::unique_lock< std::mutex > lock(mutex);
+	if (wake_socket != INVALID_SOCKET) {
+		std::string data = "!";
+		#ifdef _WIN32
+		sendto(wake_socket, data.data(), data.size(), 0, reinterpret_cast< sockaddr * >(&wake_addr), sizeof(wake_addr));
+		#else
+		sendto(wake_socket, data.data(), data.size(), MSG_DONTWAIT, reinterpret_cast< sockaddr * >(&wake_addr), sizeof(wake_addr));
+		#endif
+	}
 }
 
 inline response::~response() {
@@ -530,16 +590,13 @@ inline response::~response() {
 	message += "Content-Length: " + std::to_string(body.size()) + "\r\n";
 	message += "\r\n";
 	message += body;
-	assert(message.size() > 0);
-
-	std::cerr << "Message for " << shared_message.get() << " gets data:\n" << message << std::endl; //DEBUG
 
 	{ //copy to send queue:
 		std::unique_lock< std::mutex > lock(owner->mutex);
 		shared_message->data = std::move(message);
 		shared_message->ready = true;
-		assert(shared_message->data.size() > 0);
 	}
+
 	//wake server:
 	owner->wake();
 }

@@ -12,7 +12,7 @@ test : test.o tweak.o
 	g++ -Wall -Werror -DTWEAK_ENABLE -o test test.o tweak.o
 
 test-http : test-http.cpp http.hpp
-	g++ -Wall -Werror -DTWEAK_ENABLE -o test-http test-http.cpp
+	g++ -Wall -Werror -DTWEAK_ENABLE -o test-http test-http.cpp -lpthread
 
 clean :
 	rm -f test test.o tweak.o
