@@ -1,6 +1,7 @@
 #ifdef TWEAK_ENABLE
 
 #include "tweak.hpp"
+#include "http.hpp"
 
 #include <unordered_set>
 #include <map>
@@ -9,44 +10,25 @@
 #include <mutex>
 #include <thread>
 
-#ifdef _WIN32
-	#ifndef WIN32_LEAN_AND_MEAN
-		#define WIN32_LEAN_AND_MEAN 1
-	#endif
-
-	#include <winsock2.h>
-	#undef max
-
-	typedef SOCKET Socket;
-	const Socket InvalidSocket = INVALID_SOCKET;
-	typedef int ssize_t;
-#else //Linux / OSX:
-
-	#include <sys/types.h>
-	#include <sys/socket.h>
-	#include <arpa/inet.h>
-	#include <netinet/ip.h>
-	#include <unistd.h>
-
-	typedef int Socket;
-	const Socket InvalidSocket = -1;
-
-	#define closesocket close
-#endif
-
-
 //helpers used to convert utf8 strings to/from utf8-encoded JSON string values:
-bool json_to_utf8(std::string const &data, std::string *out, std::string *error = nullptr);
-std::string utf8_to_json(std::string const &data);
+static bool json_to_utf8(std::string const &data, std::string *out, std::string *error = nullptr);
+static std::string utf8_to_json(std::string const &data);
 
 namespace tweak {
 
 namespace {
+	struct poll {
+		poll(uint32_t _serial, std::unique_ptr< http::response > &&_response) : serial(_serial), response(std::move(_response)) { }
+		uint32_t serial;
+		std::unique_ptr< http::response > response;
+	};
 	//internal data, plus paranoia about global initialization order:
 	struct internal {
 		std::mutex mutex;
 		std::unordered_set< tweak * > tweaks;
 		uint16_t port = 1138;
+		std::unique_ptr< http::server > server;
+		std::list< poll > polls;
 
 		uint32_t state_serial = 0;
 		std::string state = "";
@@ -61,8 +43,6 @@ namespace {
 		return internal;
 	}
 }
-
-void wake_server(); //helper that wakes (or starts) server.
 
 tweak::tweak(
 	std::string _name,
@@ -91,13 +71,37 @@ void config(uint16_t port) {
 	auto &internal = get_internal();
 	std::unique_lock< std::mutex > lock(internal.mutex);
 	internal.port = port;
-
-	if (internal.server_thread) wake_server(); //wake server if thread exists so it can reconfigure itself.
+	if (internal.server) internal.server.reset(); //kill off server so it will be started with new port.
 }
 
 void sync() {
 	auto &internal = get_internal();
 	std::unique_lock< std::mutex > lock(internal.mutex);
+
+	if (!internal.server) internal.server = std::make_unique< http::server >(internal.port);
+
+	//Read adjustments (and poll requests) from the server:
+	internal.server->poll([&](http::request &request, std::unique_ptr< http::response > response){
+		if (request.method == "GET" && request.url == "/") {
+			//serve UI(?)
+			response->body = "<html><body>hello.</body></html>";
+		} else if (request.method == "GET" && request.url == "/tweaks") {
+			//serve current state (...by registering a poll):
+			internal.polls.emplace_back(0, std::move(response));
+		} else if (request.method == "GET" && request.url.substr(0,8) == "/tweaks?") {
+			//long poll:
+			internal.polls.emplace_back(std::stoul(request.url.substr(8)), std::move(response));
+		} else if (request.method == "POST" && request.url == "/tweaks") {
+			//adjust current state
+			//... TODO ...
+			(void)json_to_utf8;
+		} else {
+			response->status.code = 404;
+			response->status.message = "Not Found";
+			response->body = "Not Found";
+			response->headers.emplace_back("Content-Type", "text/plain");
+		}
+	});
 
 	//Read all adjustments from the server, and encode current state and hits:
 	std::map< std::string, std::string > state;
@@ -117,113 +121,32 @@ void sync() {
 	}
 	all_state += "\n}";
 
-	//if state has changed, wake server:
+	//if state has changed, update serial:
 	if (internal.state != all_state) {
-		all_state = internal.state;
+		internal.state = all_state;
 		++internal.state_serial;
-		wake_server(); //state changed, server might want to send it out.
 	}
-}
 
-
-
-static void server_main(internal *_internal) {
-	assert(_internal);
-	auto &internal = *_internal;
-	//TODO: be an HTTP server (!)
-
-	int16_t port = 0;
-	Socket socket = InvalidSocket;
-
-	auto init = [&](){
-		{ //create socket:
-			socket = ::socket(AF_INET, SOCK_STREAM, 0);
-			if (socket == InvalidSocket) {
-				std::cerr << "Failed to create socket" << std::endl;
-				return;
-			}
+	//respond to polls:
+	for (auto poll = internal.polls.begin(); poll != internal.polls.end(); /* later */) {
+		auto next = poll;
+		++next;
+		if (poll->serial != internal.state_serial) {
+			poll->response->body = "{\"serial\":" + std::to_string(internal.state_serial) + ",\"state\":" + internal.state + "}";
+			poll->response->headers.emplace_back("Content-Type", "application/json");
+			internal.polls.erase(poll);
 		}
-
-		{ //make it okay to reuse port
-		#ifdef WINDOWS
-			BOOL one = TRUE;
-			int ret = setsockopt(socket, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast< const char * >(&one), sizeof(one));
-		#else
-			int one = 1;
-			int ret = setsockopt(socket, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-		#endif
-			if (ret != 0) {
-				std::cerr << "WARNING: Failed to set socket reuse address." << std::endl;
-			}
-		}
-
-		{ //bind to address
-			struct sockaddr_in addr;
-			memset(&addr, 0, sizeof(addr));
-			addr.sin_family = AF_INET;
-			addr.sin_port = htons(port);
-			addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-			int ret = bind(socket, reinterpret_cast< sockaddr * >(&addr), sizeof(addr));
-			if (ret < 0) {
-				#ifdef WINDOWS
-				static char buffer[1000];
-				if (0 != strerror_s(buffer, errno)) {
-					buffer[0] = '\0';
-				}
-				std::cerr << "ERROR: Failed to bind socket (" << buffer << ")" << std::endl;
-				#else
-				std::cerr << "ERROR: Failed to bind socket (" << strerror(errno) << ")" << std::endl;
-				#endif
-				closesocket(socket);
-				socket = InvalidSocket;
-				return;
-			}
-		}
-
-		{ //listen on socket
-			int ret = listen(socket, 5);
-			if (ret < 0) {
-				std::cerr << "ERROR: Failed to listen on socket." << std::endl;
-				closesocket(socket);
-				socket = InvalidSocket;
-				return;
-			}
-		}
-	}; //init()
-
-
-
-}
-
-void wake_server() {
-	#ifdef WINDOWS
-	static bool inited = false;
-	if (!inited) {
-		WSADATA info;
-		int ret = WSAStartup((2 << 8) | 2, &info);
-		if (ret != 0) {
-			LOG_ERROR("Failed to initialize sockets");
-			return;
-		}
-		inited = true;
+		poll = next;
 	}
-	#endif
-
-	auto &internal = get_internal();
-	std::unique_lock< std::mutex > lock(internal.mutex);
-	if (!internal.server_thread) {
-		internal.server_thread.reset(new std::thread(server_main, &internal));
-	}
-	
 }
 
 
 } //namespace tweak
 
 
-static bool json_to_utf8(std::string const &data, std::string *out, std::string *error = nullptr) {
-	assert(*_out);
-	auto it = std::back_inserter(*out);
+static bool json_to_utf8(std::string const &data, std::string *_out, std::string *error) {
+	assert(_out);
+	auto it = std::back_inserter(*_out);
 	auto c = data.begin();
 
 	auto read_hex4 = [&]() -> uint16_t {
