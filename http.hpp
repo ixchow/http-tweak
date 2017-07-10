@@ -29,17 +29,17 @@
  *
  */
 
-#include <cmath>
 #include <string>
 #include <vector>
 #include <functional>
 #include <memory>
 #include <atomic>
-#include <cassert>
 #include <list>
 #include <iostream>
 
+#include <cassert>
 #include <cstring> //for memset()
+#include <cmath> //for lround(), floor()
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -91,6 +91,7 @@ struct response {
 #ifdef _WIN32
 typedef SOCKET socket;
 //typedef int ssize_t; //maybe?
+#define MSG_DONTWAIT 0 //on windows, sockets are set to non-blocking with an ioctl
 #else
 typedef int socket;
 const socket INVALID_SOCKET = -1;
@@ -108,6 +109,7 @@ struct server {
 	socket listen_socket = INVALID_SOCKET;
 	std::list< client > clients;
 	bool polling = false;
+	std::unique_ptr< char[] > buffer; //buffer used for recv() in poll(), kept around to avoid repeated de- / re- allocation
 };
 
 
@@ -142,8 +144,8 @@ struct incoming_request : request {
 		Body,
 	} mode = RequestLine;
 
-	uint32_t content_remains = 0;
-	std::string line = "";
+	uint32_t body_remains = 0; //bytes of Body content that remain (set by Content-Length: header)
+	std::string line = ""; //current line being parsed
 	void reset() {
 		*this = incoming_request();
 	}
@@ -151,29 +153,27 @@ struct incoming_request : request {
 		for (char const *c = begin; c < begin + count; ++c) {
 			if (mode == RequestLine || mode == HeaderLine) {
 				line += *c;
-				//at end-of-line, do something:
+				//once line is complete, parse it:
 				if (line.size() >= 2 && line[line.size() - 2] == '\r' && line[line.size()-1] == '\n') {
 					line.erase(line.size()-2); //trim CRLF
 
 					if (mode == RequestLine) {
-						if (line.size() == 0) {
-							//ignore empty line before request
-						} else {
+						if (line.size() != 0) { //ignore empty lines before request
 							//parse "method SP url SP version"
-							auto i1 = line.find(' ');
+							std::string::size_type i1 = line.find(' ');
 							if (i1 == std::string::npos) return false;
-							auto i2 = line.find(' ', i1+1);
+							std::string::size_type i2 = line.find(' ', i1+1);
 							if (i1 == std::string::npos) return false;
 							method = line.substr(0, i1);
 							url = line.substr(i1+1, i2-(i1+1));
 							std::string version = line.substr(i2+1);
 							if (version.substr(0,7) != "HTTP/1.") return false; //unsupported http version
 
-							mode = HeaderLine;
+							mode = HeaderLine; //next lines are headers
 						}
 					} else { assert(mode == HeaderLine);
 						if (line.size() == 0) {
-							//empty line between headers and body!
+							//empty line separates headers from body
 
 							//clean up headers by trimming whitespace as per the spec:
 							for (auto &nf : headers) {
@@ -192,15 +192,15 @@ struct incoming_request : request {
 								nf.second = value;
 							}
 
-							//set content_remains based on size of body passed in content header:
+							//set body_remains based on size of body passed in content header:
 							for (auto const &nf : headers) {
 								if (case_insensitive_equals(nf.first, "Content-Length")) {
-									content_remains = std::stoul(nf.second);
+									body_remains = std::stoul(nf.second);
 								}
 							}
 
 							mode = Body;
-							if (content_remains == 0) {
+							if (body_remains == 0) {
 								on_finish();
 								reset();
 							}
@@ -224,10 +224,10 @@ struct incoming_request : request {
 					line = ""; //clear line, now that it's parsed
 				}
 			} else if (mode == Body) {
-				assert(content_remains != 0);
+				assert(body_remains != 0);
 				body += *c;
-				--content_remains;
-				if (content_remains == 0) {
+				--body_remains;
+				if (body_remains == 0) {
 					on_finish();
 					reset();
 				}
@@ -246,18 +246,11 @@ struct client {
 inline server::server(uint16_t port) {
 
 	#ifdef _WIN32
-	static bool inited = [](){
+	{ //init winsock:
 		WSADATA info;
-		int ret = WSAStartup((2 << 8) | 2, &info);
-		if (ret != 0) {
-			return false;
-		} else {
-			return true;
+		if (WSAStartup((2 << 8) | 2, &info) != 0) {
+			throw std::runtime_error("WSAStartup failed.");
 		}
-	}();
-	if (!inited) {
-		std::cerr << "[server::server] ERROR: WSAStartup failed." << std::endl;
-		return;
 	}
 	#endif
 
@@ -269,13 +262,13 @@ inline server::server(uint16_t port) {
 		}
 	}
 	{ //make it okay to reuse port:
-	#ifdef _WIN32
+		#ifdef _WIN32
 		BOOL one = TRUE;
 		int ret = setsockopt(listen_socket, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast< const char * >(&one), sizeof(one));
-	#else
+		#else
 		int one = 1;
 		int ret = setsockopt(listen_socket, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-	#endif
+		#endif
 		if (ret != 0) {
 			std::cerr << "[server::server] WARNING: Failed to set socket reuse address." << std::endl;
 		}
@@ -305,6 +298,9 @@ inline server::server(uint16_t port) {
 }
 
 inline server::~server() {
+	#ifdef _WIN32
+	WSACleanup();
+	#endif //_WIN32
 	closesocket(listen_socket);
 }
 
@@ -352,11 +348,7 @@ inline void server::poll(std::function< void(request &, std::unique_ptr< respons
 	//add new clients as needed:
 	if (FD_ISSET(listen_socket, &read_fds)) {
 		socket got = accept(listen_socket, NULL, NULL);
-		#ifdef _WIN32
 		if (got == INVALID_SOCKET) {
-		#else
-		if (got < 0) {
-		#endif
 			//oh well.
 		} else {
 			#ifdef _WIN32
@@ -372,18 +364,16 @@ inline void server::poll(std::function< void(request &, std::unique_ptr< respons
 		}
 	}
 
+	
+	const uint32_t BufferSize = 20000;
+	if (!buffer) buffer = std::make_unique< char[] >(BufferSize);
 
 	//process requests:
 	for (auto &c : clients) {
 		if (!FD_ISSET(c.socket, &read_fds)) continue; //don't bother if not marked readable
 
-		const uint32_t BufferSize = 40000;
-		static char *buf = new char[BufferSize];
-		#ifdef _WIN32
-		ssize_t ret = recv(c.socket, buf, BufferSize, 0);
-		#else
+		char *buf = buffer.get();
 		ssize_t ret = recv(c.socket, buf, BufferSize, MSG_DONTWAIT);
-		#endif
 		if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
 			//~no problem~ but no data
 		} else if (ret <= 0 || ret > (ssize_t)BufferSize) {
@@ -427,11 +417,7 @@ inline void server::poll(std::function< void(request &, std::unique_ptr< respons
 		if (!FD_ISSET(c.socket, &write_fds)) continue; //don't bother if not marked writable
 		while (c.first_message && c.first_message->ready.load(std::memory_order_acquire)) {
 			std::string &data = c.first_message->data;
-			#ifdef _WIN32
-			ssize_t ret = send(c.socket, data.data(), data.size(), 0);
-			#else
 			ssize_t ret = send(c.socket, data.data(), data.size(), MSG_DONTWAIT);
-			#endif
 			if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
 				//~no problem~, but don't keep trying
 				break;
