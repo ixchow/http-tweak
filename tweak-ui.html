@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html>
+<head>
+</head>
+<body>
+<div id="controls">
+</div>
+</body>
+<script>
+
+function makeTweakControl(name, hint, value) {
+	//generic control:
+	var div = document.createElement('DIV');
+	var control = {
+		name:name,
+		hint:hint,
+		value:value,
+		elt:div
+	};
+
+	var label = document.createElement('LABEL');
+	label.innerText = name + ': ';
+	div.appendChild(label);
+	var input = document.createElement('INPUT');
+	input.type = "text";
+	input.value = value;
+	input.onchange = function(){
+		control.newValue = input.value;
+		pushTweaks();
+	};
+	div.appendChild(input);
+	var control = {
+		name:name,
+		hint:hint,
+		_value:value,
+		get value() { return this._value; },
+		set value(v) {
+			this._value = v;
+			input.value = v;
+		},
+		elt:div
+	};
+	return control;
+}
+
+
+var lastSerial = 0;
+var lastState = {};
+
+var controls = {};
+
+var controlsDiv = document.getElementById("controls");
+
+function syncState() {
+	for (var name in controls) {
+		if (!(name in lastState)) {
+			controls[name].elt.parentNode.removeChild(elt);
+			delete controls[name];
+		}
+	}
+	for (var name in lastState) {
+		if (!(name in controls)) {
+			var control = makeTweakControl(name, lastState[name].hint, lastState[name].value);
+			controls[name] = control;
+			controlsDiv.appendChild(controls[name].elt);
+		} else if (controls[name].hint !== lastState[name].hint) {
+			var control = makeTweakControl(name, lastState[name].hint, lastState[name].value);
+			controlsDiv.replaceChild(controls[name].elt, control.elt);
+			controls[name] = control;
+		} else if (controls[name].value !== lastState[name].value) {
+			controls[name].value = lastState[name].value;
+		}
+		console.log(name);
+
+	}
+}
+
+function pollTweaks() {
+	if ('polling' in pollTweaks) {
+		console.log("Note: trying to pollTweaks when already polling.");
+		return;
+	}
+	pollTweaks.polling = true;
+	var xhr = new XMLHttpRequest();
+	xhr.onreadystatechange = function() {
+		if (xhr.readyState !== XMLHttpRequest.DONE) return;
+		delete pollTweaks.polling;
+		window.setTimeout(pollTweaks, 1000); //poll again in a bit
+		try {
+			if (xhr.status !== 200) {
+				console.log("Request failed somehow.");
+				return;
+			}
+			console.log(xhr.responseText);
+			var response = JSON.parse(xhr.responseText);
+			lastSerial = response.serial;
+			lastState = response.state;
+			syncState();
+		} catch ( e ) {
+			console.log("Request raised an exception:",e);
+		}
+	};
+	xhr.open('GET', 'tweaks?' + lastSerial);
+	xhr.send();
+}
+pollTweaks();
+
+function pushTweaks() {
+	var message = { };
+	var haveNew = false;
+	for (var name in controls) {
+		if (controls[name].newValue) {
+			message[name] = controls[name].newValue;
+			delete controls[name].newValue;
+			haveNew = true;
+		}
+	}
+
+	if (!haveNew) {
+		console.log("pushTweaks called with no new values.");
+		return;
+	}
+
+	var xhr = new XMLHttpRequest();
+	xhr.onreadystatechange = function() {
+		if (xhr.readyState !== XMLHttpRequest.DONE) return;
+		try {
+			if (xhr.status !== 200) {
+				console.log("Push failed somehow.");
+				return;
+			}
+		} catch ( e ) {
+			console.log("Request raised an exception:",e);
+		}
+	};
+	xhr.open('POST', 'tweaks');
+
+	xhr.send(JSON.stringify(message));
+}
+
+</script>
+</html>

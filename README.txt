@@ -5,7 +5,7 @@ Usage:
 	#include <tweak.hpp>
 
 	//during program init (optional)
-	TWEAK_CONFIG("localhost:8888"); //address to bind on
+	TWEAK_CONFIG("localhost:8888", "tweak-ui.html"); //address to bind on + ui HTML file
 
 	float JumpHeight = 1.0f; //default value
 	TWEAK(JumpHeight); //set as adjustable (within the scope of TWEAK_INIT)

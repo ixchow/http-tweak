@@ -5,13 +5,16 @@
 #include <string>
 #include <functional>
 
-#define TWEAK_CONFIG(addr) tweak::config(addr)
+#define TWEAK_CONFIG(addr,ui) tweak::config(addr,ui)
 #define TWEAK(var) tweak::tweak var ## _tweak = tweak::make_tweak(#var, &var)
 #define TWEAK_SYNC() tweak::sync()
 
 namespace tweak {
 
-void config(uint16_t port); //port to bind on; always binds to loopback
+void config(
+	uint16_t port, //port to bind; always binds to loopback
+	std::string const &ui_file //filename of ui html to serve
+);
 
 void sync(); //update tweaked items
 
@@ -55,7 +58,7 @@ tweak make_tweak(std::string name, T *val) {
 #else //TWEAK_ENABLE
 //If tweak is not enabled, all TWEAK_*() statements are no-ops:
 
-#define TWEAK_CONFIG(addr)
+#define TWEAK_CONFIG(addr,ui)
 #define TWEAK(var)
 #define TWEAK_SYNC()
 

@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <mutex>
 #include <thread>
+#include <fstream>
+#include <sstream>
 
 //helpers used to convert utf8 strings to/from utf8-encoded JSON string values:
 static bool json_to_utf8(std::string const &data, std::string *out, std::string *error = nullptr);
@@ -24,6 +26,8 @@ namespace {
 	};
 	//internal data, plus paranoia about global initialization order:
 	struct internal {
+		std::string ui_file = "tweak-ui.html"; //file to serve when '/' is requested.
+
 		std::mutex mutex;
 		std::unordered_set< tweak * > tweaks;
 		uint16_t port = 1138;
@@ -67,10 +71,11 @@ tweak::~tweak() {
 	internal.tweaks.erase(f);
 }
 
-void config(uint16_t port) {
+void config(uint16_t port, std::string const &ui_file) {
 	auto &internal = get_internal();
 	std::unique_lock< std::mutex > lock(internal.mutex);
 	internal.port = port;
+	internal.ui_file = ui_file;
 	if (internal.server) internal.server.reset(); //kill off server so it will be started with new port.
 }
 
@@ -83,17 +88,113 @@ void sync() {
 	//Read adjustments (and poll requests) from the server:
 	internal.server->poll([&](http::request &request, std::unique_ptr< http::response > response){
 		if (request.method == "GET" && request.url == "/") {
-			//serve UI(?)
-			response->body = "<html><body>hello.</body></html>";
+			//serve UI:
+			std::ifstream ui(internal.ui_file, std::ios::binary);
+			std::ostringstream ss;
+			ss << ui.rdbuf();
+			response->body = ss.str();
 		} else if (request.method == "GET" && request.url == "/tweaks") {
 			//serve current state (...by registering a poll):
 			internal.polls.emplace_back(0, std::move(response));
 		} else if (request.method == "GET" && request.url.substr(0,8) == "/tweaks?") {
 			//long poll:
-			internal.polls.emplace_back(std::stoul(request.url.substr(8)), std::move(response));
+			uint32_t serial = -1U;
+			try {
+				serial = std::stoul(request.url.substr(8));
+			} catch (...) {
+				std::cerr << "[tweak::sync()] got invalid serial in url '" + request.url + "'." << std::endl;
+				serial = -1U;
+			}
+			if (serial != -1U) {
+				internal.polls.emplace_back(std::stoul(request.url.substr(8)), std::move(response));
+			}
 		} else if (request.method == "POST" && request.url == "/tweaks") {
 			//adjust current state
-			//... TODO ...
+			//std::cout << "Got tweaks:\n" << request.body << std::endl; //DEBUG
+
+			//looking at something like: {"name":"value","name2":"value2",...}
+
+			std::string const &json = request.body;
+			uint32_t i = 0;
+			auto skip_wsp = [&json,&i]() {
+				while (i < json.size()
+					&& (json[i] == 0x09 || json[i] == 0x0A || json[i] == 0x0D || json[i] == 0x20)
+					) ++i;
+			};
+			auto skip_char = [&json,&i](char c) -> bool {
+				if (i >= json.size()) return false;
+				if (json[i] != c) return false;
+				++i;
+				return true;
+			};
+			auto extract_string = [&json, &i](std::string *into) -> bool {
+				if (i >= json.size() || json[i] != '"') return false;
+				uint32_t begin = i;
+				++i;
+				while (i < json.size() && json[i] != '"') {
+					if (json[i] == '\\') ++i;
+					++i;
+				}
+				if (i >= json.size()) return false;
+				assert(json[i] == '"');
+				++i;
+				uint32_t end = i;
+				std::string data = json.substr(begin, end - begin);
+				std::string err = "";
+				if (!json_to_utf8(data, into, &err)) {
+					std::cerr << "Error decoding json string: " << err << std::endl;
+					return false;
+				}
+				return true;
+			};
+			skip_wsp();
+			if (!skip_char('{')) {
+				std::cerr << "Missing opening '{'" << std::endl;
+				return;
+			}
+			skip_wsp();
+			bool first = true;
+			while (i < json.size()) {
+				if (json[i] == '}') break; //closing character
+				if (first) {
+					first = false;
+				} else {
+					if (!skip_char(',')) {
+						std::cerr << "Missing separating ','" << std::endl;
+						return;
+					}
+					skip_wsp();
+				}
+				std::string name, value;
+				if (!extract_string(&name)) {
+					std::cerr << "Missing name string." << std::endl;
+					return;
+				}
+				skip_wsp();
+				if (!skip_char(':')) {
+					std::cerr << "Missing separating ':'" << std::endl;
+					return;
+				}
+				skip_wsp();
+				if (!extract_string(&value)) {
+					std::cerr << "Missing value string." << std::endl;
+					return;
+				}
+
+				//std::cout << "Received: '" << name << "':'" << value << "'" << std::endl; //DEBUG
+				internal.received[name] = value;
+
+				skip_wsp();
+			}
+			if (!skip_char('}')) {
+				std::cerr << "Missing closing '{'" << std::endl;
+				return;
+			}
+			skip_wsp();
+			if (i < json.size()) {
+				std::cerr << "Trailing garbage" << std::endl;
+				return;
+			}
 			(void)json_to_utf8;
 		} else {
 			response->status.code = 404;
@@ -108,7 +209,11 @@ void sync() {
 	for (auto tweak : internal.tweaks) {
 		auto f = internal.received.find(tweak->name);
 		if (f != internal.received.end()) {
-			tweak->deserialize(f->second);
+			try {
+				tweak->deserialize(f->second);
+			} catch (...) {
+				std::cerr << "Failed to deserialize " << f->first << " from '" << f->second << "'" << std::endl;
+			}
 		}
 		state[tweak->name] = "{\"hint\":" + utf8_to_json(tweak->hint) + ",\"value\":" + utf8_to_json(tweak->serialize()) + "}";
 	}
