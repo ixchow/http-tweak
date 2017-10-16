@@ -195,7 +195,6 @@ void sync() {
 				std::cerr << "Trailing garbage" << std::endl;
 				return;
 			}
-			(void)json_to_utf8;
 		} else {
 			response->status.code = 404;
 			response->status.message = "Not Found";

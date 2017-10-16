@@ -1,0 +1,25 @@
+CPP=cl.exe /nologo /c /EHsc /W3 /WX /MD /wd4146
+LINK=link.exe /nologo /SUBSYSTEM:CONSOLE
+LIBS=ws2_32.lib
+
+test-http.exe : objs/test-http.obj
+	$(LINK) /out:test-http.exe objs/test-http.obj $(LIBS)
+
+test.exe : objs/test.obj objs/tweak.obj
+	$(LINK) /out:test.exe objs/test.obj objs/tweak.obj $(LIBS)
+
+clean :
+	if exist objs rmdir /S /Q objs
+	if exist main del test-http
+
+objs/test-http.obj : test-http.cpp http.hpp
+	if not exist objs mkdir objs
+	$(CPP) $(INCLUDES) /Foobjs/test-http.obj test-http.cpp
+
+objs/tweak.obj : tweak.cpp tweak.hpp http.hpp
+	if not exist objs mkdir objs
+	$(CPP) $(INCLUDES) /DTWEAK_ENABLE /Foobjs/tweak.obj tweak.cpp
+
+objs/test.obj : test.cpp tweak.hpp http.hpp
+	if not exist objs mkdir objs
+	$(CPP) $(INCLUDES) /DTWEAK_ENABLE /Foobjs/test.obj test.cpp

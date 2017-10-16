@@ -40,6 +40,7 @@
 #include <cassert>
 #include <cstring> //for memset()
 #include <cmath> //for lround(), floor()
+#include <algorithm>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -90,7 +91,7 @@ struct response {
 
 #ifdef _WIN32
 typedef SOCKET socket;
-//typedef int ssize_t; //maybe?
+typedef int ssize_t;
 #define MSG_DONTWAIT 0 //on windows, sockets are set to non-blocking with an ioctl
 #else
 typedef int socket;
@@ -317,7 +318,7 @@ inline void server::poll(std::function< void(request &, std::unique_ptr< respons
 	FD_SET(listen_socket, &read_fds);
 
 	for (auto c : clients) {
-		max = std::max(max, c.socket);
+		max = std::max< int >(max, c.socket);
 		FD_SET(c.socket, &read_fds);
 		if (c.first_message && c.first_message->ready.load(std::memory_order_acquire)) {
 			FD_SET(c.socket, &write_fds);
@@ -331,7 +332,7 @@ inline void server::poll(std::function< void(request &, std::unique_ptr< respons
 		#ifdef _WIN32
 		//On windows nfds is ignored -- https://msdn.microsoft.com/en-us/library/windows/desktop/ms740141(v=vs.85).aspx
 		//needed? (void)max; //suppress unused variable warning
-		int ret = select(InvalidSocket, &read_fds, &write_fds, NULL, &tv);
+		int ret = select(max + 1, &read_fds, &write_fds, NULL, &tv);
 		#else
 		int ret = select(max + 1, &read_fds, &write_fds, NULL, &tv);
 		#endif

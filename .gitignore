@@ -1,3 +1,6 @@
 test
+test.exe
 test-http
+test-http.exe
 *.o
+*.obj

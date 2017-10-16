@@ -1,7 +1,5 @@
 #include "tweak.hpp"
 
-#include <unistd.h>
-
 #include <iostream>
 #include <thread>
 #include <chrono>
