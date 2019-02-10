@@ -326,7 +326,7 @@ static bool json_to_utf8(std::string const &data, std::string *_out, std::string
 		if (c == data.end() || *c != '"') throw std::runtime_error("String doesn't end with quote.");
 		++c;
 		if (c != data.end()) throw std::runtime_error("Trailing characters after string.");
-	} catch (std::runtime_error e) {
+	} catch (std::runtime_error const &e) {
 		if (error) *error = e.what();
 		return false;
 	}
