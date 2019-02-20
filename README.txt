@@ -18,7 +18,7 @@ Usage:
 		//... rest of runloop ...
 	}
 
-TWEAK and TWEAK_HINT both create objects to track that the variable is to be tweaked. So you need to make sure they don't go out of scope.
+TWEAK and TWEAK_HINT both create objects to track the tweaked. So you need to make sure they don't go out of scope.
 
 Note:
 	During build: -DTWEAK_ENABLE , link against tweak.cpp .
