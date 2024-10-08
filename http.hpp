@@ -104,7 +104,7 @@ struct server {
 
 	//receive data, pass any new requests to handle_request, and send any pending responses:
 	// (timeout is in seconds, and is how long poll() will wait for activity before returning)
-	void poll(std::function< void(request &, std::unique_ptr< response > response) > const &handle_request, double timeout = 0.0);
+	void poll(std::function< void(request const &, std::unique_ptr< response >) > const &handle_request, double timeout = 0.0);
 
 	//------- internals -------
 	socket listen_socket = INVALID_SOCKET;
@@ -305,7 +305,7 @@ inline server::~server() {
 	closesocket(listen_socket);
 }
 
-inline void server::poll(std::function< void(request &, std::unique_ptr< response > response) > const &handle_request, double timeout) {
+inline void server::poll(std::function< void(request const &, std::unique_ptr< response > response) > const &handle_request, double timeout) {
 	assert(!polling && "You must not call server.poll() from within a server.poll() callback.");
 
 	polling = true;

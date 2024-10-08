@@ -86,7 +86,7 @@ void sync() {
 	if (!internal.server) internal.server = std::make_unique< http::server >(internal.port);
 
 	//Read adjustments (and poll requests) from the server:
-	internal.server->poll([&](http::request &request, std::unique_ptr< http::response > response){
+	internal.server->poll([&](http::request const &request, std::unique_ptr< http::response > response){
 		if (request.method == "GET" && request.url == "/") {
 			//serve UI:
 			std::ifstream ui(internal.ui_file, std::ios::binary);
