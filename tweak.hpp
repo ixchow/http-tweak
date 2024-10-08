@@ -4,6 +4,7 @@
 
 #include <string>
 #include <functional>
+#include <cstdint>
 
 #define TWEAK_CONFIG(addr,ui) tweak::config(addr,ui)
 #define TWEAK(var) tweak::tweak var ## _tweak = tweak::make_tweak(#var, &var)
